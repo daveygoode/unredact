@@ -101,6 +101,7 @@ async def upload_pdf(file: UploadFile):
         "page_count": len(pages),
         "pages": page_data,
         "tmp": tmp,  # prevent cleanup
+        "filename": file.filename or f"document_{doc_id}.pdf",
     }
 
     return {"doc_id": doc_id, "page_count": len(pages)}
@@ -717,6 +718,59 @@ async def spot(doc_id: str, page: int, data: dict):
         "w": result.w, "h": result.h,
         "analysis": analysis_json,
     }
+
+
+class ExportRequest(BaseModel):
+    validate: bool = True
+    output_dir: str = ""  # defaults to cwd
+
+
+@app.post("/api/doc/{doc_id}/export")
+async def export_doc(doc_id: str, req: ExportRequest):
+    """Run the full export pipeline: solve all redactions and write markdown + report."""
+    doc = _docs.get(doc_id)
+    if not doc:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    from unredact.pipeline.export import export_document
+
+    # Ensure analysis has been run on all pages
+    pages_data: dict[int, tuple] = {}
+    for page_num, pd in doc["pages"].items():
+        analysis = pd.get("analysis")
+        if analysis is None:
+            return JSONResponse(
+                {"error": f"page {page_num} has not been analyzed yet — run /api/doc/{doc_id}/analyze first"},
+                status_code=400,
+            )
+        pages_data[page_num] = (analysis, pd["original"])
+
+    output_dir = Path(req.output_dir) if req.output_dir else Path.cwd()
+    doc_name = doc.get("filename", f"document_{doc_id}.pdf")
+
+    progress_events = []
+
+    def on_progress(event, data):
+        progress_events.append({"event": event, **data})
+
+    async def event_generator():
+        yield json.dumps({"status": "started", "pages": len(pages_data)})
+
+        try:
+            md_path, report_path = await export_document(
+                doc_name, pages_data, output_dir,
+                validate=req.validate,
+                on_progress=on_progress,
+            )
+            yield json.dumps({
+                "status": "complete",
+                "markdown_path": str(md_path),
+                "report_path": str(report_path),
+            })
+        except Exception as exc:
+            yield json.dumps({"status": "error", "error": str(exc)})
+
+    return EventSourceResponse(event_generator())
 
 
 # Static files mount MUST be after all route definitions

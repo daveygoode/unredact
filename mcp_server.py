@@ -591,6 +591,72 @@ async def analyze_pdf(file_path: str) -> str:
     return json.dumps(result, indent=2)
 
 
+@mcp.tool()
+async def unredact_document(
+    file_path: str,
+    output_dir: str = "",
+    validate: bool = True,
+) -> str:
+    """Full end-to-end pipeline: upload a PDF, analyze it, solve all redactions,
+    and export a Markdown file with the unredacted text plus a detailed report.
+
+    Args:
+        file_path: Absolute path to a PDF file.
+        output_dir: Directory to write output files (defaults to same dir as PDF).
+        validate: Whether to run LLM validation for confidence scores (default True).
+
+    Returns:
+        Paths to the generated markdown and report files, plus a summary.
+    """
+    p = Path(file_path)
+    if not p.exists():
+        return f"Error: file not found: {file_path}"
+
+    out_dir = Path(output_dir) if output_dir else p.parent
+
+    # Step 1: Upload
+    async with httpx.AsyncClient(base_url=APP_URL, timeout=120) as client:
+        resp = await client.post(
+            "/api/upload",
+            files={"file": (p.name, p.read_bytes(), "application/pdf")},
+        )
+        resp.raise_for_status()
+        upload = resp.json()
+
+    doc_id = upload["doc_id"]
+    page_count = upload["page_count"]
+
+    # Step 2: OCR
+    await _consume_sse("GET", f"/api/doc/{doc_id}/ocr")
+
+    # Step 3: Analyze (detect redactions + fonts)
+    await _consume_sse("GET", f"/api/doc/{doc_id}/analyze")
+
+    # Step 4: Export (solve + validate + write files)
+    export_events = await _consume_sse(
+        "POST",
+        f"/api/doc/{doc_id}/export",
+        json={"validate": validate, "output_dir": str(out_dir)},
+    )
+
+    # Find the completion event
+    for e in export_events:
+        if e.get("status") == "complete":
+            return json.dumps({
+                "markdown_path": e["markdown_path"],
+                "report_path": e["report_path"],
+                "doc_id": doc_id,
+                "page_count": page_count,
+                "message": "Document unredacted successfully. "
+                           "Check the markdown file for the full text and "
+                           "the report file for detailed analysis.",
+            }, indent=2)
+        elif e.get("status") == "error":
+            return f"Export failed: {e.get('error', 'unknown error')}"
+
+    return "Export completed but no completion event received."
+
+
 # ── Entrypoint ────────────────────────────────────────────────────
 
 if __name__ == "__main__":
