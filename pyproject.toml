@@ -30,6 +30,10 @@ build = [
     "pandas>=2.0",
     "pyarrow>=14.0",
 ]
+mcp = [
+    "mcp[cli]>=1.0",
+    "httpx>=0.28",
+]
 
 [build-system]
 requires = ["setuptools>=75"]
